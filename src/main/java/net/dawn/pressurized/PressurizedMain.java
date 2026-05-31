@@ -21,7 +21,6 @@ package net.dawn.pressurized;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.*;
-import com.mojang.logging.LogUtils;
 import net.dawn.pressurized.Client.ClientConfigs;
 import net.dawn.pressurized.Client.PressurizedClient;
 import net.dawn.pressurized.Network.*;
@@ -48,7 +47,6 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterGuiOverlaysEvent;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.common.util.Lazy;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.level.BlockEvent;
@@ -65,11 +63,10 @@ import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.network.PacketDistributor;
 import net.minecraftforge.registries.ForgeRegistries;
 import org.joml.Math;
-import org.slf4j.Logger;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static net.dawn.pressurized.BlocksResistanceData.*;
 import static net.dawn.pressurized.VSCompat.*;
@@ -78,16 +75,13 @@ import static net.dawn.pressurized.VSCompat.*;
 public class PressurizedMain {
     public static final String MODID = "pressurized";
 
-    private static final Logger LOGGER = LogUtils.getLogger();
-
     private PressurizedClient HudOverlay;
 
     static HashMap<String, Integer> BlocksPressureResistance = new HashMap<>();
     public static final ConcurrentHashMap<Integer, Map.Entry<BlockPos, Integer>> CrushedBlocks = new ConcurrentHashMap<>();
     public static final HashMap<Entity, Integer> EntitiesDepth = new HashMap<>();
 
-    static final Collection<BlockPos> SkipThread = new CopyOnWriteArrayList<>();
-    static final Map<BlockPos, HashMap<Thread, Boolean>> DestroyThreads = new HashMap<>();
+    static final Map<BlockPos, Boolean> PendingCrushActions = new ConcurrentHashMap<>();
     static final ArrayList<Integer> RemovalCollection = new ArrayList<>();
 
     static int ServerTicks = 0;
@@ -220,34 +214,11 @@ public class PressurizedMain {
                     Networking.CHANNEL3.send(PacketDistributor.ALL.noArg(), new UpdateCBArray(CrushedBlocks.size(), blockPos));
                 }
 
-                for (BlockPos B : DestroyThreads.keySet()) {
-                    HashMap<Thread, Boolean> IDK = DestroyThreads.get(B);
-                    for (Thread T : IDK.keySet()) {
-                        Boolean InterruptThread = IDK.get(T);
-                        if (InterruptThread) {
-                            T.interrupt();
-                        }
-                    }
-                }
-
                 if (ServerTicks >= ServerConfigs.BlockScanRate.get()) {
                     for (Map.Entry<Integer, Map.Entry<BlockPos, Integer>> BlockMap : CrushedBlocks.entrySet()) {
                         Map.Entry<BlockPos, Integer> entry = BlockMap.getValue();
                         BlockPos key = entry.getKey();
-                        boolean SkipIteration = false;
-
-                        try {
-                            for (BlockPos bp : SkipThread) {
-                                if (bp.equals(key)) {
-                                    SkipIteration = true;
-                                    break;
-                                }
-                            }
-                        } catch (NullPointerException e) {
-                            throw new RuntimeException();
-                        }
-
-                        if (SkipIteration) {
+                        if (PendingCrushActions.containsKey(key)) {
                             continue;
                         }
 
@@ -255,41 +226,52 @@ public class PressurizedMain {
                             RemovalCollection.add(BlockMap.getKey());
                             continue;
                         }
-                        SkipThread.add(key);
+                        if (PendingCrushActions.putIfAbsent(key, Boolean.TRUE) != null) {
+                            continue;
+                        }
+
+                        final int blockId = BlockMap.getKey();
+                        final BlockPos pendingKey = key;
+                        long Delay = ThreadLocalRandom.current().nextLong(0, 5000);
 
                         Thread t = new Thread(() -> {
-                            long Delay = new Random().nextLong(0, 5000);
                             try {
                                 Thread.sleep(Delay);
-                                if (!Thread.currentThread().isInterrupted()) {
-                                    if (entry.getValue() > 7) {
-                                        level.getBlockState(key);
-                                        synchronized (RemovalCollection) {
-                                            RemovalCollection.add(BlockMap.getKey());
-                                        }
-                                        level.destroyBlock(key, true);
-                                        level.addDestroyBlockEffect(key, level.getBlockState(key));
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                level.getServer().execute(() -> PendingCrushActions.remove(pendingKey));
+                                return;
+                            }
+
+                            level.getServer().execute(() -> {
+                                try {
+                                    Map.Entry<BlockPos, Integer> currentEntry = CrushedBlocks.get(blockId);
+                                    if (currentEntry == null || !currentEntry.getKey().equals(pendingKey)) {
+                                        return;
+                                    }
+
+                                    if (level.getBlockState(pendingKey.above()).isSolid()) {
+                                        RemovalCollection.add(blockId);
+                                        return;
+                                    }
+
+                                    if (currentEntry.getValue() > 7) {
+                                        RemovalCollection.add(blockId);
+                                        level.destroyBlock(pendingKey, true);
+                                        level.addDestroyBlockEffect(pendingKey, level.getBlockState(pendingKey));
                                     } else {
                                         Networking.CHANNEL4.send(
                                                 PacketDistributor.ALL.noArg(),
-                                                new UpdateCBTexture(entry.getKey(), entry.getValue()+1)
+                                                new UpdateCBTexture(currentEntry.getKey(), currentEntry.getValue()+1)
                                         );
-                                        BlockMap.setValue(Map.entry(entry.getKey(), entry.getValue()+1));
+                                        CrushedBlocks.put(blockId, Map.entry(currentEntry.getKey(), currentEntry.getValue()+1));
                                     }
-                                    synchronized (SkipThread) {
-                                        SkipThread.remove(key);
-                                    }
-                                    synchronized (DestroyThreads) {
-                                        DestroyThreads.get(key).replace(Thread.currentThread(), true);
-                                    }
+                                } finally {
+                                    PendingCrushActions.remove(pendingKey);
                                 }
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                            }
-                        });
-                        HashMap<Thread, Boolean> Data = new HashMap<>();
-                        Data.put(t, false);
-                        DestroyThreads.put(key, Data);
+                            });
+                        }, "Pressurized-Crush-" + pendingKey.asLong());
+                        t.setDaemon(true);
                         t.start();
                     }
                 }
@@ -408,6 +390,8 @@ public class PressurizedMain {
         //}
     }
 
+
+        boolean ProcessedCrushActions = false;
     int Delay = 0;
 
     @SubscribeEvent
@@ -677,84 +661,88 @@ public class PressurizedMain {
             //NOTE: this entire if statement is for Crushed Blocks damage sfx, buh
 
             if (!PressurizedClient.HullDamageThread) {
-                // if (!player.isUnderWater() || CrushedBlocks.isEmpty()) {return;}
                 PressurizedClient.HullDamageThread = true;
-                new Thread(() -> {
+                Thread hullDamageThread = new Thread(() -> {
                     try {
                         Thread.sleep(5000);
                     } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                    PressurizedClient.HullDamageThread = false;
-                    if (!PressurizedClient.Player.isUnderWater() || CrushedBlocks.isEmpty()) {
+                        Thread.currentThread().interrupt();
+                        Minecraft.getInstance().execute(() -> PressurizedClient.HullDamageThread = false);
                         return;
                     }
 
-                    int X = 0;
-                    int Y = 0;
-                    int Z = 0;
+                    Minecraft.getInstance().execute(() -> {
+                        try {
+                            if (Minecraft.getInstance().player == null || !Minecraft.getInstance().player.isUnderWater() || CrushedBlocks.isEmpty()) {
+                                return;
+                            }
 
-                    for (Map.Entry<Integer, Map.Entry<BlockPos, Integer>> BlockMap : CrushedBlocks.entrySet()) {
-                        BlockPos key = BlockMap.getValue().getKey();
+                            PressurizedClient.Player = Minecraft.getInstance().player;
 
-                        X += key.getX();
-                        Y += key.getY();
-                        Z += key.getZ();
-                    }
+                            int X = 0;
+                            int Y = 0;
+                            int Z = 0;
 
-                    X /= CrushedBlocks.size();
-                    Y /= CrushedBlocks.size();
-                    Z /= CrushedBlocks.size();
+                            for (Map.Entry<Integer, Map.Entry<BlockPos, Integer>> BlockMap : CrushedBlocks.entrySet()) {
+                                BlockPos key = BlockMap.getValue().getKey();
 
-                    BlockPos blockPos = new BlockPos(X, Y, Z);
-                    BlockState Blockstate = Minecraft.getInstance().player.level().getBlockState(blockPos);
+                                X += key.getX();
+                                Y += key.getY();
+                                Z += key.getZ();
+                            }
 
-                    double deltaX = PressurizedClient.Player.getOnPos().getX() - blockPos.getX();
-                    double deltaY = PressurizedClient.Player.getOnPos().getY() - blockPos.getY();
-                    double deltaZ = PressurizedClient.Player.getOnPos().getZ() - blockPos.getZ();
+                            X /= CrushedBlocks.size();
+                            Y /= CrushedBlocks.size();
+                            Z /= CrushedBlocks.size();
 
-                    double Distance = Math.sqrt((deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ));
-                    String Name = Objects.requireNonNull(ForgeRegistries.BLOCKS.getKey(Blockstate.getBlock())).getPath();
+                            BlockPos blockPos = new BlockPos(X, Y, Z);
+                            BlockState Blockstate = Minecraft.getInstance().player.level().getBlockState(blockPos);
 
-                    for (String BlockName : MetalBlocks) {
-                        if (BlockName.equals(Name)) {
-                            //    event.player.playSound(ModSounds.HULLDAMAGE.get(), (float) (1f / Distance), 1f);
+                            String Name = Objects.requireNonNull(ForgeRegistries.BLOCKS.getKey(Blockstate.getBlock())).getPath();
+
+                            for (String BlockName : MetalBlocks) {
+                                if (BlockName.equals(Name)) {
+                                    //    event.player.playSound(ModSounds.HULLDAMAGE.get(), (float) (1f / Distance), 1f);
+                                }
+                            }
+
+                            for (String BlockName : StoneBlocks) {
+                                if (BlockName.equals(Name)) {
+                                    //    event.player.playSound(ModSounds.ENVIRONMENTDAMAGE.get(), (float) (1f / Distance), 1f);
+                                }
+                            }
+
+                            // event.player.level().playSound(null, X, Y, Z,
+                            //         ModSounds.HULLDAMAGE.get(), SoundSource.BLOCKS,(float) (1f/Distance), 1f);
+                        } finally {
+                            PressurizedClient.HullDamageThread = false;
                         }
-                    }
-
-                    for (String BlockName : StoneBlocks) {
-                        if (BlockName.equals(Name)) {
-                            //    event.player.playSound(ModSounds.ENVIRONMENTDAMAGE.get(), (float) (1f / Distance), 1f);
-                        }
-                    }
-
-                    // event.player.level().playSound(null, X, Y, Z,
-                    //         ModSounds.HULLDAMAGE.get(), SoundSource.BLOCKS,(float) (1f/Distance), 1f);
-                }).start();
+                    });
+                }, "Pressurized-HullDamage");
+                hullDamageThread.setDaemon(true);
+                hullDamageThread.start();
             }
 
-            new Thread(() -> {
-                if (PressurizedClient.PressureImmunity) {
+            if (PressurizedClient.PressureImmunity) {
+                PressurizedClient.BodyPressure = PressurizedClient.Depth;
+            } else {
+                if (PressurizedClient.BodyPressure > PressurizedClient.Depth) {
+                    PressurizedClient.BodyPressure -= .075;
+                } else if (PressurizedClient.BodyPressure < PressurizedClient.Depth) {
+                    PressurizedClient.BodyPressure += .075;
+                } else if (PressurizedClient.BodyPressure - PressurizedClient.Depth >= .025) {
                     PressurizedClient.BodyPressure = PressurizedClient.Depth;
-                } else {
-                    if (PressurizedClient.BodyPressure > PressurizedClient.Depth) {
-                        PressurizedClient.BodyPressure -= .075;
-                    } else if (PressurizedClient.BodyPressure < PressurizedClient.Depth) {
-                        PressurizedClient.BodyPressure += .075;
-                    } else if (PressurizedClient.BodyPressure - PressurizedClient.Depth >= .025) {
-                        PressurizedClient.BodyPressure = PressurizedClient.Depth;
-                    }
                 }
+            }
 
-                if (PressurizedClient.CrushImmunity || PressurizedClient.Depth > PressurizedClient.CrushDepth) {
-                    if (PressurizedClient.PressureBuildup > 0) {
-                        PressurizedClient.PressureBuildup -= .1;
-                        if (PressurizedClient.PressureBuildup < 0) {
-                            PressurizedClient.PressureBuildup = 0;
-                        }
+            if (PressurizedClient.CrushImmunity || PressurizedClient.Depth > PressurizedClient.CrushDepth) {
+                if (PressurizedClient.PressureBuildup > 0) {
+                    PressurizedClient.PressureBuildup -= .1;
+                    if (PressurizedClient.PressureBuildup < 0) {
+                        PressurizedClient.PressureBuildup = 0;
                     }
                 }
-            }).start();
+            }
 
             if (PressurizedClient.Player.isUnderWater() & !PressurizedClient.Player.isCreative()) {
                 String Helmet = PressurizedClient.Player.getItemBySlot(EquipmentSlot.HEAD).getItem().toString();
